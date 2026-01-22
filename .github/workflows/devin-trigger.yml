@@ -1,0 +1,948 @@
+# Reusable workflow for Devin issue investigation trigger
+# Called by individual repos via workflow_call
+#
+# Usage in caller repo:
+#   jobs:
+#     devin:
+#       uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@v1
+#       secrets:
+#         DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+#       with:
+#         playbook_id: ${{ vars.DEVIN_ISSUE_PLAYBOOK_ID }}
+
+name: Devin Issue Trigger
+
+on:
+  workflow_call:
+    inputs:
+      playbook_id:
+        description: "Devin playbook ID for issue investigations"
+        type: string
+        required: false
+      issue_number:
+        description: "Issue number (for workflow_dispatch from caller)"
+        type: number
+        required: false
+    secrets:
+      DEVIN_API_KEY:
+        description: "Devin API key"
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  # Job 1: Authorization check (NO SECRETS)
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      action: ${{ steps.check.outputs.action }}
+      additional_context: ${{ steps.check.outputs.additional_context }}
+
+    # Pre-filter at job level
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'devin') ||
+      (github.event_name == 'issue_comment' &&
+       !github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/devin'))
+
+    steps:
+      - name: Check Authorization
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const comment = context.payload.comment;
+            const isCommentTrigger = context.eventName === 'issue_comment';
+            const isWorkflowDispatch = context.eventName === 'workflow_dispatch';
+
+            // Default outputs
+            core.setOutput('authorized', 'false');
+            core.setOutput('action', 'skip');
+            core.setOutput('additional_context', '');
+
+            // For workflow_dispatch, always authorize
+            if (isWorkflowDispatch) {
+              core.setOutput('authorized', 'true');
+              core.setOutput('action', 'trigger');
+              core.info('Workflow dispatch: authorized');
+              return;
+            }
+
+            if (isCommentTrigger) {
+              // Check if it's a bot
+              if (comment.user.type === 'Bot') {
+                core.info('Ignoring bot comment');
+                return;
+              }
+
+              // Check org membership
+              const validAssociations = ['MEMBER', 'OWNER'];
+              if (!validAssociations.includes(comment.author_association)) {
+                core.info(`Rejecting: ${comment.author_association} not in allowed list`);
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `@${comment.user.login} Only organization members can trigger Devin. A maintainer can add the \`devin\` label to start an investigation.`
+                });
+                return;
+              }
+
+              // Parse command
+              const body = comment.body.trim().toLowerCase();
+
+              if (body === '/devin cancel') {
+                core.setOutput('authorized', 'true');
+                core.setOutput('action', 'cancel');
+                return;
+              }
+
+              if (body.startsWith('/devin')) {
+                // Extract additional context after /devin
+                const additionalContext = comment.body.substring('/devin'.length).trim();
+                core.setOutput('authorized', 'true');
+                core.setOutput('action', 'trigger');
+                core.setOutput('additional_context', additionalContext);
+                return;
+              }
+            } else {
+              // Label trigger - always authorized (GitHub handles label permissions)
+              core.setOutput('authorized', 'true');
+              core.setOutput('action', 'trigger');
+            }
+
+  # Job 2: Cancel session (with secret, only if authorized for cancel)
+  cancel-session:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true' && needs.authorize.outputs.action == 'cancel'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cancel Devin Session
+        uses: actions/github-script@v7
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        with:
+          script: |
+            // === HELPER FUNCTIONS FOR CONTROL COMMENT STATE ===
+            const STATE_LABELS = [
+              'devin-investigating',
+              'devin-needs-info',
+              'devin-stuck',
+              'devin-done',
+              'devin-pr-created',
+              'devin-failed',
+              'devin-cancelled'
+            ];
+
+            // Base64 state encoding (avoids regex fragility with JSON)
+            const MARKER_RE = /<!-- ps:devin:state:v1=([A-Za-z0-9+/=]+) -->/;
+
+            function encodeState(state) {
+              return Buffer.from(JSON.stringify(state), 'utf8').toString('base64');
+            }
+
+            function decodeState(b64) {
+              return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+            }
+
+            function issueTagKey(owner, repo, issueNumber) {
+              return `ps-gh-issue-${owner}-${repo}-${issueNumber}`;
+            }
+
+            async function findControlComment(github, owner, repo, issueNumber) {
+              // Find bot-authored comment with state marker
+              // listComments returns oldest-first, so we iterate in reverse to get the newest
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+
+              // Iterate newest-first to find the most recent control comment
+              for (let i = comments.length - 1; i >= 0; i--) {
+                const comment = comments[i];
+                // Guard against deleted users (comment.user can be null)
+                if (comment.user?.login === 'github-actions[bot]' && MARKER_RE.test(comment.body)) {
+                  const match = comment.body.match(MARKER_RE);
+                  if (match) {
+                    try {
+                      return { comment, state: decodeState(match[1]) };
+                    } catch (e) {
+                      // Fail fast: if newest marker is corrupted, don't fall back to older (stale) comments
+                      core.warning(`Corrupted state in newest control comment ${comment.id}: ${e.message}`);
+                      return null;
+                    }
+                  }
+                }
+              }
+              return null;
+            }
+
+            /**
+             * Query Devin API for active sessions with a given tag.
+             * @returns {Object} Result object with one of:
+             *   - { session: <session> } - found an active session
+             *   - { session: null } - no active sessions with this tag
+             *   - { error: true } - API failure (do NOT treat as "no session")
+             */
+            async function findSessionByTag(issueTag) {
+              let response;
+              try {
+                response = await fetch(
+                  `https://api.devin.ai/v1/sessions?tags=${encodeURIComponent(issueTag)}`,
+                  { headers: { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` } }
+                );
+              } catch (e) {
+                core.warning(`Network error querying sessions by tag: ${e.message}`);
+                return { error: true };
+              }
+
+              // Distinguish between "no sessions" and "API failure"
+              if (response.status === 404) {
+                return { session: null };
+              }
+
+              if (!response.ok) {
+                core.warning(`Failed to query sessions by tag: ${response.status}`);
+                return { error: true };
+              }
+
+              const data = await response.json();
+              const allSessions = data.sessions || data || [];
+
+              // Sort by created_at descending (newest first) since API ordering is unspecified
+              allSessions.sort((a, b) => {
+                const dateA = new Date(a.created_at || 0);
+                const dateB = new Date(b.created_at || 0);
+                return dateB - dateA;
+              });
+
+              // Return most recent active session
+              const activeStatuses = ['working', 'resumed', 'blocked', 'suspend_requested', 'suspend_requested_frontend', 'resume_requested', 'resume_requested_frontend'];
+              for (const session of allSessions) {
+                if (activeStatuses.includes(session.status_enum)) {
+                  return { session };
+                }
+              }
+              return { session: null };
+            }
+
+            async function setStateLabels(github, owner, repo, issueNumber, newLabel) {
+              // Remove ALL state labels first (mutual exclusivity)
+              for (const label of STATE_LABELS) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: label });
+                } catch (e) {
+                  if (e.status !== 404) {
+                    core.warning(`Failed to remove ${label}: ${e.message}`);
+                  }
+                }
+              }
+              // Add the new state label
+              if (newLabel) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: [newLabel] });
+                } catch (e) {
+                  core.warning(`Failed to add ${newLabel}: ${e.message}`);
+                }
+              }
+            }
+
+            // === MAIN CANCEL LOGIC ===
+            const issueNumber = context.payload.issue?.number
+              || Number(${{ inputs.issue_number || 0 }});
+
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setFailed('Invalid or missing issue_number');
+              return;
+            }
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            const issueTag = issueTagKey(context.repo.owner, context.repo.repo, issueNumber);
+
+            // Find control comment with state
+            let controlData = await findControlComment(
+              github, context.repo.owner, context.repo.repo, issueNumber
+            );
+
+            let state = controlData?.state;
+            let controlComment = controlData?.comment;
+
+            // If no control comment, attempt tag recovery
+            if (!state) {
+              core.info('No control comment found, attempting tag recovery for cancel...');
+              const recoveryResult = await findSessionByTag(issueTag);
+
+              // API failure - inform user and abort
+              if (recoveryResult.error) {
+                core.warning('Devin API unavailable during cancel recovery');
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: 'Unable to cancel: Devin API is currently unavailable. Please try again later.'
+                });
+                return;
+              }
+
+              const recoveredSession = recoveryResult.session;
+              if (recoveredSession) {
+                core.info(`Recovered session ${recoveredSession.session_id} via tag for cancel`);
+                state = {
+                  v: 1,
+                  session_id: recoveredSession.session_id,
+                  url: recoveredSession.url,
+                  started_at: recoveredSession.created_at,
+                  issue_tag: issueTag
+                };
+                // No control comment to update, will create cancellation notice below
+              } else {
+                core.info('No active session found (no control comment or tag match)');
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: 'No active Devin session found to cancel.'
+                });
+                return;
+              }
+            }
+
+            if (state.cancelled) {
+              core.info('Session already cancelled');
+              return;
+            }
+
+            // Terminate session using DELETE
+            const response = await fetch(`https://api.devin.ai/v1/sessions/${state.session_id}`, {
+              method: 'DELETE',
+              headers: { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` }
+            });
+
+            core.info(`Terminate response: ${response.status}`);
+
+            // 404 acceptable = already terminated
+            if (!response.ok && response.status !== 404) {
+              const errorText = await response.text();
+              core.warning(`Failed to terminate session: ${response.status} - ${errorText}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Failed to cancel Devin session (${response.status}). The session may still be running.\n\n**Session:** [View in Devin](${state.url})`
+              });
+              return;
+            }
+
+            // Update labels (mutual exclusivity)
+            await setStateLabels(github, context.repo.owner, context.repo.repo, issue.number, 'devin-cancelled');
+
+            // Update or create control comment to mark as cancelled
+            const cancelledState = { ...state, cancelled: true, cancelled_at: new Date().toISOString() };
+            const cancelledBy = context.payload.comment?.user?.login
+              || context.payload.sender?.login
+              || context.actor;
+
+            const cancelledCommentBody = [
+              `## Devin Session (Cancelled)`,
+              '',
+              `**Session:** [View in Devin](${state.url})`,
+              `**Cancelled by:** @${cancelledBy}`,
+              `**Cancelled at:** ${cancelledState.cancelled_at}`,
+              '',
+              `<!-- ps:devin:state:v1=${encodeState(cancelledState)} -->`
+            ].join('\n');
+
+            if (controlComment) {
+              // Update existing control comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: controlComment.id,
+                body: cancelledCommentBody
+              });
+            } else {
+              // Create control comment (recovered via tag, no existing comment)
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: cancelledCommentBody
+              });
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `Devin investigation cancelled by @${cancelledBy}.\n\n**Session:** [View in Devin](${state.url})`
+            });
+
+  # Job 3: Create/resume session (with secret, only if authorized for trigger)
+  create-session:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true' && needs.authorize.outputs.action == 'trigger'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create Devin Session
+        uses: actions/github-script@v7
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_PLAYBOOK_ID: ${{ inputs.playbook_id }}
+        with:
+          script: |
+            // === HELPER FUNCTIONS FOR CONTROL COMMENT STATE ===
+            const STATE_LABELS = [
+              'devin-investigating',
+              'devin-needs-info',
+              'devin-stuck',
+              'devin-done',
+              'devin-pr-created',
+              'devin-failed',
+              'devin-cancelled'
+            ];
+
+            // Base64 state encoding (avoids regex fragility with JSON)
+            const MARKER_RE = /<!-- ps:devin:state:v1=([A-Za-z0-9+/=]+) -->/;
+
+            function encodeState(state) {
+              return Buffer.from(JSON.stringify(state), 'utf8').toString('base64');
+            }
+
+            function decodeState(b64) {
+              return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+            }
+
+            function issueTagKey(owner, repo, issueNumber) {
+              return `ps-gh-issue-${owner}-${repo}-${issueNumber}`;
+            }
+
+            function repoTagKey(owner, repo) {
+              return `ps-gh-repo-${owner}-${repo}`;
+            }
+
+            async function findControlComment(github, owner, repo, issueNumber) {
+              // listComments returns oldest-first, so we iterate in reverse to get the newest
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+
+              // Iterate newest-first to find the most recent control comment
+              for (let i = comments.length - 1; i >= 0; i--) {
+                const comment = comments[i];
+                // Guard against deleted users (comment.user can be null)
+                if (comment.user?.login === 'github-actions[bot]' && MARKER_RE.test(comment.body)) {
+                  const match = comment.body.match(MARKER_RE);
+                  if (match) {
+                    try {
+                      return { comment, state: decodeState(match[1]) };
+                    } catch (e) {
+                      // Fail fast: if newest marker is corrupted, don't fall back to older (stale) comments
+                      core.warning(`Corrupted state in newest control comment ${comment.id}: ${e.message}`);
+                      return null;
+                    }
+                  }
+                }
+              }
+              return null;
+            }
+
+            /**
+             * Query Devin API for active sessions with a given tag.
+             * @returns {Object} Result object with one of:
+             *   - { session: <session> } - found an active session
+             *   - { session: null } - no active sessions with this tag
+             *   - { error: true } - API failure (do NOT treat as "no session")
+             */
+            async function findSessionByTag(issueTag) {
+              let response;
+              try {
+                response = await fetch(
+                  `https://api.devin.ai/v1/sessions?tags=${encodeURIComponent(issueTag)}`,
+                  { headers: { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` } }
+                );
+              } catch (e) {
+                core.warning(`Network error querying sessions by tag: ${e.message}`);
+                return { error: true };
+              }
+
+              // Distinguish between "no sessions" and "API failure"
+              if (response.status === 404) {
+                return { session: null };
+              }
+
+              if (!response.ok) {
+                core.warning(`Failed to query sessions by tag: ${response.status}`);
+                return { error: true };
+              }
+
+              const data = await response.json();
+              const allSessions = data.sessions || data || [];
+
+              // Sort by created_at descending (newest first) since API ordering is unspecified
+              allSessions.sort((a, b) => {
+                const dateA = new Date(a.created_at || 0);
+                const dateB = new Date(b.created_at || 0);
+                return dateB - dateA;
+              });
+
+              // Return most recent active session
+              const activeStatuses = ['working', 'resumed', 'blocked', 'suspend_requested', 'suspend_requested_frontend', 'resume_requested', 'resume_requested_frontend'];
+              for (const session of allSessions) {
+                if (activeStatuses.includes(session.status_enum)) {
+                  return { session };
+                }
+              }
+              return { session: null };
+            }
+
+            async function setStateLabels(github, owner, repo, issueNumber, newLabel) {
+              // Remove ALL state labels first (mutual exclusivity)
+              for (const label of STATE_LABELS) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: label });
+                } catch (e) {
+                  if (e.status !== 404) {
+                    core.warning(`Failed to remove ${label}: ${e.message}`);
+                  }
+                }
+              }
+              // Add the new state label
+              if (newLabel) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: [newLabel] });
+                } catch (e) {
+                  core.warning(`Failed to add ${newLabel}: ${e.message}`);
+                }
+              }
+            }
+
+            // === MAIN CREATE/RESUME LOGIC ===
+            const issueNumber = context.payload.issue?.number
+              || Number(${{ inputs.issue_number || 0 }});
+
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setFailed('Invalid or missing issue_number');
+              return;
+            }
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            const comment = context.payload.comment;
+            const isCommentTrigger = context.eventName === 'issue_comment';
+            // Sanitize user-provided context to prevent marker injection
+            const rawContext = ${{ toJson(needs.authorize.outputs.additional_context) }};
+            const additionalContext = rawContext ? rawContext.replace(/<!--\s*ps:devin:state:v1=[^>]*-->/g, '[marker-removed]') : '';
+            const issueTag = issueTagKey(context.repo.owner, context.repo.repo, issueNumber);
+            const repoTag = repoTagKey(context.repo.owner, context.repo.repo);
+
+            // === IDEMPOTENCY: Check for existing session ===
+            // Step 1: Look for control comment
+            let controlData = await findControlComment(
+              github, context.repo.owner, context.repo.repo, issueNumber
+            );
+
+            let existingState = controlData?.state;
+            let controlComment = controlData?.comment;
+
+            // Step 2: If no control comment, try to recover via Devin tags
+            if (!existingState) {
+              core.info('No control comment found, checking Devin API by tag...');
+              const recoveryResult = await findSessionByTag(issueTag);
+
+              // API failure - inform user and abort (don't accidentally create duplicate session)
+              if (recoveryResult.error) {
+                core.warning('Devin API unavailable during session check');
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: 'Unable to start Devin: API is currently unavailable. Please try again later by adding the `devin` label or using `/devin`.'
+                });
+                return;
+              }
+
+              const existingSession = recoveryResult.session;
+              if (existingSession) {
+                core.info(`Found existing session via tag: ${existingSession.session_id}`);
+                existingState = {
+                  session_id: existingSession.session_id,
+                  url: existingSession.url,
+                  started_at: existingSession.created_at,
+                  issue_tag: issueTag
+                };
+                // Will create control comment below
+              }
+            }
+
+            // === HANDLE EXISTING ACTIVE SESSION ===
+            if (existingState?.session_id && !existingState.cancelled) {
+              const statusResponse = await fetch(
+                `https://api.devin.ai/v1/sessions/${existingState.session_id}`,
+                { headers: { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` } }
+              );
+
+              if (statusResponse.ok) {
+                let statusData;
+                try {
+                  statusData = await statusResponse.json();
+                } catch (e) {
+                  core.warning(`Failed to parse status response: ${e.message}`);
+                  existingState = null;
+                }
+
+                const activeStatuses = [
+                  'working', 'resumed', 'suspend_requested',
+                  'suspend_requested_frontend', 'resume_requested', 'resume_requested_frontend'
+                ];
+                const blockedStatuses = ['blocked'];
+
+                if (statusData && (activeStatuses.includes(statusData.status_enum) || blockedStatuses.includes(statusData.status_enum))) {
+                  const isBlocked = blockedStatuses.includes(statusData.status_enum);
+
+                  // If we recovered via tag, create the control comment now
+                  if (!controlComment) {
+                    const state = {
+                      v: 1,
+                      session_id: existingState.session_id,
+                      url: existingState.url,
+                      started_at: existingState.started_at,
+                      issue_tag: issueTag,
+                      last_status: statusData.status_enum
+                    };
+                    const controlBody = [
+                      '## Devin Session',
+                      '',
+                      `**Session:** [View in Devin](${existingState.url})`,
+                      `**Status:** ${statusData.status_enum}`,
+                      `**Started:** ${existingState.started_at}`,
+                      '',
+                      `<!-- ps:devin:state:v1=${encodeState(state)} -->`
+                    ].join('\n');
+
+                    const { data: newComment } = await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: controlBody
+                    });
+                    controlComment = newComment;
+                    core.info(`Created control comment ${newComment.id} from tag recovery`);
+                  }
+
+                  // Send additional context if provided
+                  if (additionalContext) {
+                    const msgResponse = await fetch(
+                      `https://api.devin.ai/v1/sessions/${existingState.session_id}/message`,
+                      {
+                        method: 'POST',
+                        headers: {
+                          'Authorization': `Bearer ${process.env.DEVIN_API_KEY}`,
+                          'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                          message: `Additional context from @${comment?.user.login || 'maintainer'}:\n\n${additionalContext}`
+                        })
+                      }
+                    );
+
+                    if (!msgResponse.ok) {
+                      const errorText = await msgResponse.text();
+                      core.warning(`Failed to send message: ${msgResponse.status} - ${errorText}`);
+                      await github.rest.issues.createComment({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: issue.number,
+                        body: `Failed to add context to Devin session (${msgResponse.status}). Please try again or view the session directly.\n\n**Session:** [View in Devin](${existingState.url})`
+                      });
+                      return;
+                    }
+
+                    // Update labels with mutual exclusivity
+                    await setStateLabels(github, context.repo.owner, context.repo.repo, issue.number, 'devin-investigating');
+
+                    const responseMessage = isBlocked
+                      ? `Added context to blocked Devin session. Devin will resume with this information.\n\n**Session:** [View in Devin](${existingState.url})`
+                      : `Added context to existing Devin session.\n\n**Session:** [View in Devin](${existingState.url})`;
+
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: responseMessage
+                    });
+                  } else {
+                    // Ensure correct label is set (especially for blocked sessions)
+                    const targetLabel = isBlocked ? 'devin-needs-info' : 'devin-investigating';
+                    await setStateLabels(github, context.repo.owner, context.repo.repo, issue.number, targetLabel);
+
+                    const responseMessage = isBlocked
+                      ? `Devin is blocked on this issue and needs more information.\n\n**Session:** [View in Devin](${existingState.url})\n\nUse \`/devin <context>\` to provide the requested information.`
+                      : `Devin is already investigating this issue.\n\n**Session:** [View in Devin](${existingState.url})\n\nUse \`/devin <context>\` to add more information.`;
+
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: responseMessage
+                    });
+                  }
+                  return;
+                }
+              }
+            }
+
+            // === BUILD CONTEXT FOR NEW SESSION ===
+            const allComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                per_page: 100
+              }
+            );
+
+            // Filter out control comments with state markers and comments from deleted users
+            const issueComments = allComments
+              .filter(c => c.user && !MARKER_RE.test(c.body))
+              .map(c => ({
+                author: c.user.login,
+                authorType: c.user.type,
+                association: c.author_association,
+                body: c.body,
+                created_at: c.created_at
+              }));
+
+            // Strip legacy devin:state markers from issue body (from older runs)
+            const cleanBody = (issue.body || '(No description)')
+              .replace(/<!--\s*devin:state=\{[^}]*\}\s*-->/g, '')
+              .trim() || '(No description)';
+
+            const issueContext = {
+              number: issue.number,
+              title: issue.title,
+              body: cleanBody,
+              author: issue.user.login,
+              labels: issue.labels.map(l => l.name),
+              url: issue.html_url,
+              created_at: issue.created_at,
+              comments: issueComments,
+              additional_context: additionalContext,
+              triggered_by: isCommentTrigger ? comment.user.login : 'label',
+              triggered_at: new Date().toISOString()
+            };
+
+            // === UPLOAD CONTEXT AS ATTACHMENT (for large issues) ===
+            const contextJson = JSON.stringify(issueContext, null, 2);
+            let attachmentUrl = null;
+
+            if (contextJson.length > 10000) {
+              const formData = new FormData();
+              formData.append('file', new Blob([contextJson], { type: 'application/json' }), `issue-${issue.number}-context.json`);
+
+              const uploadResponse = await fetch('https://api.devin.ai/v1/attachments', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` },
+                body: formData
+              });
+
+              if (uploadResponse.ok) {
+                attachmentUrl = (await uploadResponse.text()).trim();
+                core.info(`Uploaded attachment: ${attachmentUrl}`);
+              } else {
+                const errorText = await uploadResponse.text();
+                core.warning(`Attachment upload failed (${uploadResponse.status}): ${errorText}`);
+                core.info('Falling back to inline context');
+              }
+            }
+
+            // === BUILD PROMPT ===
+            const promptLines = [
+              '# GitHub Issue Investigation',
+              '',
+              `## Issue #${issue.number}: ${issue.title}`,
+              '',
+              `**Repository:** ${context.repo.owner}/${context.repo.repo}`,
+              `**Author:** @${issue.user.login}`,
+              `**Labels:** ${issue.labels.map(l => l.name).join(', ') || 'none'}`,
+              `**URL:** ${issue.html_url}`,
+              ''
+            ];
+
+            if (attachmentUrl) {
+              promptLines.push(
+                '## Full Context',
+                `The complete issue context (description + ${issueComments.length} comments) is in the attached file.`,
+                '',
+                `ATTACHMENT:"${attachmentUrl}"`,
+                ''
+              );
+            } else {
+              promptLines.push(
+                '## Description',
+                issueContext.body,
+                ''
+              );
+              if (issueComments.length > 0) {
+                promptLines.push(
+                  `## Comments (${issueComments.length})`,
+                  issueComments.slice(-10).map(c => `**@${c.author}** (${c.authorType === 'Bot' ? 'Bot' : c.association}):\n${c.body}`).join('\n\n---\n\n'),
+                  ''
+                );
+              }
+            }
+
+            if (additionalContext) {
+              promptLines.push(
+                '## Additional Context from Trigger',
+                additionalContext,
+                ''
+              );
+            }
+
+            // EMBEDDED STRUCTURED OUTPUT SCHEMA
+            promptLines.push(
+              '---',
+              '',
+              '## Structured Output (UPDATE THIS AS YOU WORK)',
+              '',
+              'You MUST update this structured output as you progress. The automation system reads this to track your status.',
+              '',
+              '```json',
+              '{',
+              '  "status": "working",',
+              '  "confidence": null,',
+              '  "confidence_reason": null,',
+              '  "outcome": null,',
+              '  "summary": null,',
+              '  "pr_url": null,',
+              '  "needs_info": [],',
+              '  "files_touched": [],',
+              '  "next_step_for_humans": null',
+              '}',
+              '```',
+              '',
+              '**Status values:** "working" | "blocked" | "finished" | "error"',
+              '**Confidence values:** "HIGH" | "MEDIUM" | "LOW"',
+              '**Outcome values:** "PR" | "ANALYSIS" | "QUESTIONS"',
+              '',
+              '---',
+              '',
+              '## Your Task',
+              '',
+              'Investigate this issue following the playbook in AGENTS.md. Assess your confidence and take appropriate action:',
+              `- **HIGH confidence:** Create a PR with implementation and tests (reference "Fixes #${issue.number}")`,
+              '- **MEDIUM confidence:** Post analysis with root cause and recommended approach',
+              '- **LOW confidence:** Post clarifying questions',
+              '',
+              'Always post your findings as a comment on the issue.',
+              'When creating a PR, include `<!-- devin:session_id=YOUR_SESSION_ID -->` in the PR body for tracking.'
+            );
+
+            const prompt = promptLines.join('\n');
+
+            // === CREATE SESSION WITH TAGS FOR RECOVERY ===
+            const sessionResponse = await fetch('https://api.devin.ai/v1/sessions', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${process.env.DEVIN_API_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                prompt: prompt,
+                playbook_id: process.env.DEVIN_PLAYBOOK_ID || undefined,
+                idempotent: true,
+                tags: [
+                  'github-issue',
+                  issueTag,   // ps-gh-issue-{owner}-{repo}-{number} - for recovery
+                  repoTag,    // ps-gh-repo-{owner}-{repo} - for repo-level queries
+                  `issue-${issue.number}`
+                ],
+                max_acu_limit: 15,
+                secret_ids: []
+              })
+            });
+
+            if (!sessionResponse.ok) {
+              const error = await sessionResponse.text();
+              core.setFailed(`Failed to create Devin session: ${error}`);
+              return;
+            }
+
+            const sessionData = await sessionResponse.json();
+            core.info(`Created session: ${sessionData.session_id}`);
+
+            // === CREATE CONTROL COMMENT (never touch issue body) ===
+            const state = {
+              v: 1,
+              session_id: sessionData.session_id,
+              url: sessionData.url,
+              started_at: new Date().toISOString(),
+              issue_tag: issueTag
+            };
+
+            const controlBody = [
+              '## Devin Session',
+              '',
+              `**Session:** [View in Devin](${sessionData.url})`,
+              `**Status:** working`,
+              `**Started:** ${state.started_at}`,
+              ''
+            ];
+            if (additionalContext) {
+              controlBody.push(`**Context provided:** ${additionalContext}`, '');
+            }
+            controlBody.push(
+              'Devin will analyze the codebase and respond with one of:',
+              '- **PR** - If confident in the solution',
+              '- **Analysis** - If multiple approaches are viable',
+              '- **Questions** - If clarification is needed',
+              '',
+              'Use `/devin <context>` to add more information, or `/devin cancel` to stop.',
+              '',
+              `<!-- ps:devin:state:v1=${encodeState(state)} -->`
+            );
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: controlBody.join('\n')
+            });
+
+            // === UPDATE LABELS (mutual exclusivity) ===
+            await setStateLabels(github, context.repo.owner, context.repo.repo, issue.number, 'devin-investigating');
+
+            // Remove the trigger label if it was the devin label
+            if (context.eventName === 'issues') {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  name: 'devin'
+                });
+              } catch (e) {
+                if (e.status !== 404) {
+                  core.warning(`Failed to remove devin label: ${e.message}`);
+                }
+              }
+            }

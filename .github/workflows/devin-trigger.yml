@@ -139,26 +139,40 @@ jobs:
             const DEVIN_BASE = `https://api.devin.ai/v3/organizations/${process.env.DEVIN_ORG_ID}`;
             const DEVIN_HEADERS = { 'Authorization': `Bearer ${process.env.DEVIN_API_KEY}` };
 
-            // Map v3 (status, status_detail) -> internal category.
-            // v3 status:        new | creating | claimed | running | exit | error | suspended | resuming
-            // v3 status_detail: working | waiting_for_user | waiting_for_approval | finished |
-            //                   inactivity | user_request | usage_limit_exceeded | out_of_credits |
-            //                   out_of_quota | no_quota_allocation | payment_declined |
-            //                   org_usage_limit_exceeded | error
+            // Map v3 (status, status_detail) + structured_output -> internal category.
+            // Per Devin v3 docs, status_detail values are partitioned by status:
+            //   running:   working | waiting_for_user | waiting_for_approval | finished
+            //   suspended: inactivity | user_request | usage_limit_exceeded | error
+            // "Suspended" is Devin's idle/sleep state — usually resumable on next /messages call,
+            // but may already be done if Devin posted a final PR or set structured_output.status='finished'.
             function classify(session) {
               const s = session?.status;
               const d = session?.status_detail;
+              const so = session?.structured_output || {};
+              const hasPr = !!session?.pull_requests?.[0]?.pr_url;
+
               if (s === 'error') return 'failed';
+
               if (s === 'exit') {
                 if (d === 'finished') return 'finished';
                 if (d === 'user_request') return 'cancelled';
                 return 'failed';
               }
+
               if (s === 'suspended') {
-                if (d === 'waiting_for_user') return 'blocked';
-                return 'active'; // waiting_for_approval, working, etc. are still in-flight
+                if (hasPr) return 'finished';
+                if (so.status === 'finished') return 'finished';
+                if (so.status === 'error') return 'failed';
+                if (d === 'usage_limit_exceeded' || d === 'error') return 'failed';
+                return 'blocked'; // default: sleeping, resumable via /devin <message>
               }
-              if (['new', 'creating', 'claimed', 'running', 'resuming'].includes(s)) return 'active';
+
+              if (['running', 'new', 'creating', 'claimed', 'resuming'].includes(s)) {
+                if (d === 'waiting_for_user') return 'blocked';
+                if (d === 'finished') return 'finished';
+                return 'active';
+              }
+
               return 'unknown';
             }
 
@@ -431,17 +445,31 @@ jobs:
             function classify(session) {
               const s = session?.status;
               const d = session?.status_detail;
+              const so = session?.structured_output || {};
+              const hasPr = !!session?.pull_requests?.[0]?.pr_url;
+
               if (s === 'error') return 'failed';
+
               if (s === 'exit') {
                 if (d === 'finished') return 'finished';
                 if (d === 'user_request') return 'cancelled';
                 return 'failed';
               }
+
               if (s === 'suspended') {
+                if (hasPr) return 'finished';
+                if (so.status === 'finished') return 'finished';
+                if (so.status === 'error') return 'failed';
+                if (d === 'usage_limit_exceeded' || d === 'error') return 'failed';
+                return 'blocked';
+              }
+
+              if (['running', 'new', 'creating', 'claimed', 'resuming'].includes(s)) {
                 if (d === 'waiting_for_user') return 'blocked';
+                if (d === 'finished') return 'finished';
                 return 'active';
               }
-              if (['new', 'creating', 'claimed', 'running', 'resuming'].includes(s)) return 'active';
+
               return 'unknown';
             }
 

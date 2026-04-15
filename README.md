@@ -21,7 +21,8 @@ Go to **Settings → Secrets and variables → Actions** and add:
 
 | Secret | Description |
 |--------|-------------|
-| `DEVIN_API_KEY` | Your Devin API key |
+| `DEVIN_API_KEY` | Devin **v3 service-user token** (starts with `cog_`). Create one in Devin → Enterprise Settings → Service Users (role: Member). |
+| `DEVIN_ORG_ID`  | Your Devin organization ID. Found in Devin → Settings → Organization. Used in every v3 URL path. |
 
 Optional variables (Settings → Secrets and variables → Actions → Variables):
 
@@ -52,10 +53,10 @@ mkdir -p .github/workflows
 
 # Using curl
 curl -o .github/workflows/devin-trigger.yml \
-  https://raw.githubusercontent.com/propstreet/github-workflows/v1/caller-templates/devin-trigger.yml
+  https://raw.githubusercontent.com/propstreet/github-workflows/v2/caller-templates/devin-trigger.yml
 
 curl -o .github/workflows/devin-monitor.yml \
-  https://raw.githubusercontent.com/propstreet/github-workflows/v1/caller-templates/devin-monitor.yml
+  https://raw.githubusercontent.com/propstreet/github-workflows/v2/caller-templates/devin-monitor.yml
 ```
 
 Or copy manually from [`caller-templates/`](./caller-templates/).
@@ -94,14 +95,23 @@ Always pin to a specific version in production:
 
 ```yaml
 # Recommended - pin to major version
-uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@v1
+uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@v2
 
 # More stable - pin to specific version
-uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@v1.0.0
+uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@v2.0.0
 
 # Most stable - pin to commit SHA
 uses: propstreet/github-workflows/.github/workflows/devin-trigger.yml@abc123def
 ```
+
+### Major version history
+
+| Tag | Devin API | Status |
+|-----|-----------|--------|
+| `v2` | v3 (`/v3/organizations/{org_id}/...`, service-user token, requires `DEVIN_ORG_ID`) | Current |
+| `v1` | v1 (`/v1/...`, personal/service API key) | Frozen — Devin docs mark v1 as "will be deprecated soon" |
+
+**Migrating from v1 → v2:** rotate `DEVIN_API_KEY` to a `cog_…` service-user token, add the `DEVIN_ORG_ID` repo secret, and bump the `@v1` reference in your caller workflow to `@v2`.
 
 ## Updating
 

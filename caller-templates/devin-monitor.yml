@@ -2,7 +2,8 @@
 # Copy this file to your repo at .github/workflows/devin-monitor.yml
 #
 # Prerequisites:
-# 1. Add DEVIN_API_KEY to repository secrets
+# 1. Add DEVIN_API_KEY (v3 service-user token, prefix cog_) to repository secrets
+# 2. Add DEVIN_ORG_ID to repository secrets
 
 name: Devin Session Monitor
 
@@ -21,6 +22,7 @@ concurrency:
 
 jobs:
   monitor:
-    uses: propstreet/github-workflows/.github/workflows/devin-monitor.yml@v1
+    uses: propstreet/github-workflows/.github/workflows/devin-monitor.yml@v2
     secrets:
       DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+      DEVIN_ORG_ID:  ${{ secrets.DEVIN_ORG_ID }}

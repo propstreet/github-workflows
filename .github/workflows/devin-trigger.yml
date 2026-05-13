@@ -806,8 +806,11 @@ jobs:
               });
 
               if (uploadResponse.ok) {
-                attachmentUrl = (await uploadResponse.text()).trim();
-                core.info(`Uploaded attachment: ${attachmentUrl}`);
+                // v3 org-scoped attachments return JSON {attachment_id, name, url};
+                // the v1 endpoint returned the URL as a plain text body.
+                const uploadResult = await uploadResponse.json();
+                attachmentUrl = uploadResult.url;
+                core.info(`Uploaded attachment: ${attachmentUrl} (id=${uploadResult.attachment_id})`);
               } else {
                 const errorText = await uploadResponse.text();
                 core.warning(`Attachment upload failed (${uploadResponse.status}): ${errorText}`);
